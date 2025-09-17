@@ -126,19 +126,23 @@ pub fn discover_claude_installations() -> Vec<ClaudeInstallation> {
 /// Returns a preference score for installation sources (lower is better)
 fn source_preference(installation: &ClaudeInstallation) -> u8 {
     match installation.source.as_str() {
-        "which" => 1,
-        "homebrew" => 2,
-        "system" => 3,
-        source if source.starts_with("nvm") => 4,
-        "local-bin" => 5,
-        "claude-local" => 6,
-        "npm-global" => 7,
-        "yarn" | "yarn-global" => 8,
-        "bun" => 9,
-        "node-modules" => 10,
-        "home-bin" => 11,
-        "PATH" => 12,
-        _ => 13,
+        "where" => 1,     // Windows equivalent of which
+        "which" => 1,     // Unix which command
+        "npm-global-windows" => 2,  // Windows npm global installs
+        "homebrew" => 3,
+        "system" => 4,
+        source if source.starts_with("nvm") => 5,
+        "local-bin" => 6,
+        "claude-local" => 7,
+        "npm-global" => 8,
+        "yarn" | "yarn-global" => 9,
+        "bun" => 10,
+        "node-modules" => 11,
+        "home-bin" => 12,
+        "program-files" => 13,     // Windows Program Files
+        "program-files-x86" => 14, // Windows Program Files (x86)
+        "PATH" => 15,
+        _ => 16,
     }
 }
 
@@ -164,11 +168,18 @@ fn discover_system_installations() -> Vec<ClaudeInstallation> {
     installations
 }
 
-/// Try using the 'which' command to find Claude
+/// Try using the 'which' command to find Claude (Unix) or 'where' command (Windows)
 fn try_which_command() -> Option<ClaudeInstallation> {
-    debug!("Trying 'which claude' to find binary...");
+    // Use 'where' on Windows, 'which' on Unix
+    let (command, command_name) = if cfg!(target_os = "windows") {
+        ("where", "where")
+    } else {
+        ("which", "which")
+    };
 
-    match Command::new("which").arg("claude").output() {
+    debug!("Trying '{} claude' to find binary...", command_name);
+
+    match Command::new(command).arg("claude").output() {
         Ok(output) if output.status.success() => {
             let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -176,21 +187,27 @@ fn try_which_command() -> Option<ClaudeInstallation> {
                 return None;
             }
 
-            // Parse aliased output: "claude: aliased to /path/to/claude"
-            let path = if output_str.starts_with("claude:") && output_str.contains("aliased to") {
-                output_str
-                    .split("aliased to")
-                    .nth(1)
-                    .map(|s| s.trim().to_string())
+            // On Windows, 'where' can return multiple paths separated by newlines
+            // Take the first one
+            let path = if cfg!(target_os = "windows") {
+                output_str.lines().next().map(|s| s.trim().to_string())
             } else {
-                Some(output_str)
+                // Parse aliased output on Unix: "claude: aliased to /path/to/claude"
+                if output_str.starts_with("claude:") && output_str.contains("aliased to") {
+                    output_str
+                        .split("aliased to")
+                        .nth(1)
+                        .map(|s| s.trim().to_string())
+                } else {
+                    Some(output_str)
+                }
             }?;
 
-            debug!("'which' found claude at: {}", path);
+            debug!("'{}' found claude at: {}", command_name, path);
 
             // Verify the path exists
             if !PathBuf::from(&path).exists() {
-                warn!("Path from 'which' does not exist: {}", path);
+                warn!("Path from '{}' does not exist: {}", command_name, path);
                 return None;
             }
 
@@ -200,7 +217,7 @@ fn try_which_command() -> Option<ClaudeInstallation> {
             Some(ClaudeInstallation {
                 path,
                 version,
-                source: "which".to_string(),
+                source: command_name.to_string(),
                 installation_type: InstallationType::System,
             })
         }
@@ -264,7 +281,56 @@ fn find_standard_installations() -> Vec<ClaudeInstallation> {
         ("/bin/claude".to_string(), "system".to_string()),
     ];
 
-    // Also check user-specific paths
+    // Check Windows-specific paths first
+    if cfg!(target_os = "windows") {
+        // Check APPDATA/Roaming/npm (most common for npm global installs on Windows)
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            paths_to_check.extend(vec![
+                (
+                    format!("{}\\npm\\claude.cmd", appdata),
+                    "npm-global-windows".to_string(),
+                ),
+                (
+                    format!("{}\\npm\\claude", appdata),
+                    "npm-global-windows".to_string(),
+                ),
+            ]);
+        }
+
+        // Check USERPROFILE paths
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            paths_to_check.extend(vec![
+                (
+                    format!("{}\\AppData\\Roaming\\npm\\claude.cmd", userprofile),
+                    "npm-global-windows".to_string(),
+                ),
+                (
+                    format!("{}\\AppData\\Roaming\\npm\\claude", userprofile),
+                    "npm-global-windows".to_string(),
+                ),
+                (
+                    format!("{}\\.claude\\local\\claude.exe", userprofile),
+                    "claude-local-windows".to_string(),
+                ),
+                (
+                    format!("{}\\.local\\bin\\claude.exe", userprofile),
+                    "local-bin-windows".to_string(),
+                ),
+                (
+                    format!("{}\\bin\\claude.exe", userprofile),
+                    "home-bin-windows".to_string(),
+                ),
+            ]);
+        }
+
+        // Check Program Files locations
+        paths_to_check.extend(vec![
+            ("C:\\Program Files\\Claude\\claude.exe".to_string(), "program-files".to_string()),
+            ("C:\\Program Files (x86)\\Claude\\claude.exe".to_string(), "program-files-x86".to_string()),
+        ]);
+    }
+
+    // Also check Unix-style user-specific paths (for WSL/Git Bash compatibility)
     if let Ok(home) = std::env::var("HOME") {
         paths_to_check.extend(vec![
             (
